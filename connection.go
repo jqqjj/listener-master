@@ -7,17 +7,19 @@ import (
 
 type Connection struct {
 	net.Conn
-	wg   *sync.WaitGroup
-	once *sync.Once
+	once     sync.Once
+	listener *Listener
 }
 
-func newConnection(wg *sync.WaitGroup, conn net.Conn) *Connection {
-	return &Connection{Conn: conn, wg: wg, once: new(sync.Once)}
+func newConnection(conn net.Conn, ln *Listener) *Connection {
+	return &Connection{Conn: conn, listener: ln}
 }
 
 func (c *Connection) Close() error {
-	c.once.Do(func() {
-		c.wg.Done()
-	})
+	defer func() {
+		c.once.Do(func() {
+			c.listener.wg.Done()
+		})
+	}()
 	return c.Conn.Close()
 }

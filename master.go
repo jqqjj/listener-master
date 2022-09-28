@@ -6,109 +6,79 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"runtime"
 	"sync"
 	"syscall"
 	"time"
 )
 
-var (
-	booted          bool
-	parentListeners []net.Listener
-)
-
-func init() {
-	parentListeners = getParentListeners()
+type master struct {
+	mux             sync.Mutex
+	waitGroup       sync.WaitGroup
+	listenerMap     map[net.Listener][]*exec.Cmd
+	workers         map[*exec.Cmd]struct{}
+	resolveAddrFunc func() []string
 }
 
-func Listeners(resolveAddrFunc func() []string) []*Listener {
-	if booted {
-		panic("this package is only allowed to be called once")
+func newMaster(resolveAddrFunc func() []string) *master {
+	return &master{
+		listenerMap:     make(map[net.Listener][]*exec.Cmd),
+		workers:         make(map[*exec.Cmd]struct{}),
+		resolveAddrFunc: resolveAddrFunc,
 	}
-	booted = true
-
-	if runtime.GOOS != "linux" {
-		var (
-			err       error
-			tcpAddr   []*net.TCPAddr
-			lns       []net.Listener
-			addresses = resolveAddrFunc()
-		)
-
-		if len(addresses) == 0 {
-			panic("getAddrFunc resolve empty addr")
-		}
-		if tcpAddr, err = parseTCPAddress(addresses); err != nil {
-			panic(err)
-		}
-		if lns, err = createListeners(tcpAddr); err != nil {
-			panic(err)
-		}
-		return parseListeners(lns)
-	}
-
-	if len(parentListeners) == 0 {
-		runMaster(resolveAddrFunc)
-	} else {
-		go runWorker()
-	}
-	return parseListeners(parentListeners)
 }
 
-func runMaster(resolveAddrFunc func() []string) {
+func (m *master) run() {
 	var (
 		err       error
-		worker    *exec.Cmd
-		workers   sync.Map
-		waitGroup sync.WaitGroup
-		tcpAddr   []*net.TCPAddr
-		listeners []net.Listener
-		addresses = resolveAddrFunc()
+		addresses []string
+		lns       []net.Listener
+		cmd       *exec.Cmd
 	)
 
+	addresses = m.resolveAddrFunc()
 	if len(addresses) == 0 {
-		panic("getAddrFunc resolve empty addr")
+		panic("resolveAddrFunc resolve empty addr")
 	}
-	if tcpAddr, err = parseTCPAddress(addresses); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+	if lns, err = m.resolveStringAddrListener(addresses...); err != nil {
+		panic(err)
 	}
-	if listeners, err = createListeners(tcpAddr); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	if worker, err = createWorker(listeners); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+	if cmd, err = m.createCmd(lns...); err != nil {
+		panic(err)
 	}
 
-	waitGroup.Add(1)
-	workers.Store(worker, nil)
-	go func(worker *exec.Cmd) {
-		defer waitGroup.Done()
-		defer workers.Delete(worker)
-		if err = worker.Run(); err != nil {
-			fmt.Println(err)
-			os.Exit(1)
+	m.waitGroup.Add(1)
+	m.attach(cmd, lns...)
+	go func(cmd *exec.Cmd) {
+		defer m.waitGroup.Done()
+		defer m.detach(cmd)
+		if err = cmd.Start(); err != nil {
+			panic(err)
 		}
-	}(worker)
+		cmd.Wait()
+	}(cmd)
 
+	m.loopEvent()
+}
+
+func (m *master) loopEvent() {
 	sig := make(chan os.Signal)
 	signal.Notify(sig, syscall.SIGHUP)
 	signal.Notify(sig, syscall.SIGINT)
 	signal.Notify(sig, syscall.SIGTERM)
+
 	for v := range sig {
 		if v.(syscall.Signal) == syscall.SIGINT || v.(syscall.Signal) == syscall.SIGTERM {
 			go func() {
 				for i := 0; i <= 3; i++ {
-					workers.Range(func(key, value any) bool {
+					m.mux.Lock()
+					for cmd := range m.workers {
 						if i == 3 {
-							_ = key.(*exec.Cmd).Process.Kill()
+							_ = cmd.Process.Kill()
 						} else {
-							_ = key.(*exec.Cmd).Process.Signal(syscall.SIGTERM)
+							_ = cmd.Process.Signal(syscall.SIGTERM)
 						}
-						return true
-					})
+					}
+					m.mux.Unlock()
 					time.Sleep(time.Second)
 				}
 			}()
@@ -116,193 +86,178 @@ func runMaster(resolveAddrFunc func() []string) {
 		}
 		if v.(syscall.Signal) == syscall.SIGHUP {
 			var (
-				newTcpAddr    []*net.TCPAddr
-				newListeners  []net.Listener
-				diffListeners []net.Listener
-				newWorker     *exec.Cmd
+				err       error
+				lns       []net.Listener
+				cmd       *exec.Cmd
+				addresses = m.resolveAddrFunc()
 			)
 
-			addresses = resolveAddrFunc()
 			if len(addresses) == 0 {
 				fmt.Println("address is empty")
 				continue
 			}
-			if newTcpAddr, err = parseTCPAddress(addresses); err != nil {
-				fmt.Println("address error")
+			if lns, err = m.resolveStringAddrListener(addresses...); err != nil {
+				fmt.Println(err)
 				continue
 			}
-			if diffListeners, err = createListeners(addrDiff(newTcpAddr, tcpAddr)); err != nil {
-				fmt.Println("fail to create listener:", err)
+			if cmd, err = m.createCmd(lns...); err != nil {
+				fmt.Println(err)
 				continue
 			}
-			for _, addr := range newTcpAddr {
-				for _, ln := range diffListeners {
-					if ln.Addr().(*net.TCPAddr).IP.Equal(addr.IP) && ln.Addr().(*net.TCPAddr).Port == addr.Port {
-						newListeners = append(newListeners, ln)
-					}
-				}
-				for _, ln := range listeners {
-					if ln.Addr().(*net.TCPAddr).IP.Equal(addr.IP) && ln.Addr().(*net.TCPAddr).Port == addr.Port {
-						newListeners = append(newListeners, ln)
-					}
-				}
-			}
-			//创建worker
-			if newWorker, err = createWorker(newListeners); err != nil {
-				fmt.Println("fail to create worker:", err)
-				for _, ln := range diffListeners {
-					_ = ln.Close()
-				}
-				continue
-			}
-			//运行worker
-			waitGroup.Add(1)
-			workers.Store(newWorker, nil)
-			if err = newWorker.Start(); err != nil {
-				fmt.Println("fail to start worker:", err)
-				workers.Delete(newWorker)
-				waitGroup.Done()
-				continue
-			}
-			go func(worker *exec.Cmd) {
-				defer waitGroup.Done()
-				defer workers.Delete(worker)
-				worker.Wait()
-			}(newWorker)
 
-			//清理不使用的listener
-			for _, ln := range listenersDiff(listeners, newListeners) {
-				_ = ln.Close()
-			}
-			//保存最新的worker状态
-			listeners = newListeners
-			tcpAddr = newTcpAddr
-			//请求优雅退出
-			workers.Range(func(key, value any) bool {
-				if key.(*exec.Cmd) != newWorker {
-					_ = key.(*exec.Cmd).Process.Signal(syscall.SIGHUP)
+			m.waitGroup.Add(1)
+			m.attach(cmd, lns...)
+			go func(cmd *exec.Cmd) {
+				defer m.waitGroup.Done()
+				defer m.detach(cmd)
+				if err = cmd.Start(); err != nil {
+					panic(err)
 				}
-				return true
-			})
+				cmd.Wait()
+			}(cmd)
+
+			//请求优雅退出
+			m.mux.Lock()
+			for worker := range m.workers {
+				if cmd != worker {
+					_ = cmd.Process.Signal(syscall.SIGHUP)
+				}
+			}
+			m.mux.Unlock()
 		}
 	}
 
-	waitGroup.Wait()
+	m.waitGroup.Wait()
 	os.Exit(0)
 }
 
-func getParentListeners() (lns []net.Listener) {
-	var (
-		err  error
-		file *os.File
-		ln   net.Listener
-	)
+func (m *master) attach(cmd *exec.Cmd, lns ...net.Listener) {
+	m.mux.Lock()
+	defer m.mux.TryLock()
 
-	for i := 3; ; i++ {
-		file = os.NewFile(uintptr(i), "")
-		if ln, err = net.FileListener(file); err != nil {
-			break
+	for _, ln := range lns {
+		if _, ok := m.listenerMap[ln]; !ok {
+			m.listenerMap[ln] = make([]*exec.Cmd, 0)
 		}
-		lns = append(lns, ln)
+		match := false
+		for _, item := range m.listenerMap[ln] {
+			if item == cmd {
+				match = true
+				break
+			}
+		}
+		if !match {
+			m.listenerMap[ln] = append(m.listenerMap[ln], cmd)
+		}
 	}
-	return
+	m.workers[cmd] = struct{}{}
 }
 
-func createListeners(addresses []*net.TCPAddr) (lns []net.Listener, err error) {
-	var ln net.Listener
+func (m *master) detach(cmd *exec.Cmd) {
+	m.mux.Lock()
+	defer m.mux.TryLock()
+
+	for ln, commands := range m.listenerMap {
+		index := -1
+		for i, item := range commands {
+			if item == cmd {
+				index = i
+				break
+			}
+		}
+		if index >= 0 {
+			m.listenerMap[ln] = append(m.listenerMap[ln][:index], m.listenerMap[ln][index+1:]...)
+		}
+		if len(m.listenerMap[ln]) == 0 {
+			_ = ln.Close()
+			delete(m.listenerMap, ln)
+		}
+	}
+	for _, file := range cmd.ExtraFiles {
+		_ = file.Close()
+	}
+	delete(m.workers, cmd)
+}
+
+func (m *master) resolveStringAddrListener(address ...string) ([]net.Listener, error) {
+	var (
+		err     error
+		tcpAddr []*net.TCPAddr
+	)
+	if tcpAddr, err = m.resolveAddr(address...); err != nil {
+		return nil, err
+	}
+	return m.resolveTcpAddrListener(tcpAddr...)
+}
+
+func (m *master) resolveTcpAddrListener(addresses ...*net.TCPAddr) ([]net.Listener, error) {
+	var (
+		err    error
+		ln     net.Listener
+		lns    []net.Listener
+		newLns []net.Listener
+	)
 	defer func() {
 		if err != nil {
-			for _, ln = range lns {
-				_ = ln.Close()
+			for _, l := range newLns {
+				_ = l.Close()
 			}
 		}
 	}()
-	for _, tcpAddr := range addresses {
-		if ln, err = net.ListenTCP("tcp", tcpAddr); err != nil {
-			return nil, err
+	for _, addr := range addresses {
+		if ln = m.findListener(addr); ln == nil {
+			if ln, err = net.ListenTCP("tcp", addr); err != nil {
+				return nil, err
+			}
+			newLns = append(newLns, ln)
 		}
 		lns = append(lns, ln)
 	}
-	return
+	return lns, nil
 }
 
-func parseTCPAddress(arr []string) (addresses []*net.TCPAddr, err error) {
+func (m *master) resolveAddr(address ...string) ([]*net.TCPAddr, error) {
 	var (
-		tcpAddr *net.TCPAddr
+		err      error
+		iterator *net.TCPAddr
+		tcpAddr  []*net.TCPAddr
 	)
-	for _, addr := range arr {
-		if tcpAddr, err = net.ResolveTCPAddr("tcp", addr); err != nil {
+	for _, v := range address {
+		if iterator, err = net.ResolveTCPAddr("tcp", v); err != nil {
 			return nil, err
 		}
-		addresses = append(addresses, tcpAddr)
+		tcpAddr = append(tcpAddr, iterator)
 	}
-	return
+	return tcpAddr, nil
 }
 
-func listenersDiff(a, b []net.Listener) []net.Listener {
-	var (
-		diff         []net.Listener
-		addrA, addrB *net.TCPAddr
-	)
-	for _, v := range a {
-		var match bool
-		addrA = v.Addr().(*net.TCPAddr)
-		for _, val := range b {
-			addrB = val.Addr().(*net.TCPAddr)
-			if addrA.IP.Equal(addrB.IP) && addrA.Port == addrB.Port {
-				match = true
-				break
-			}
-		}
-		if !match {
-			diff = append(diff, v)
+func (m *master) findListener(addr *net.TCPAddr) net.Listener {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+
+	for ln := range m.listenerMap {
+		lnAddr := ln.Addr().(*net.TCPAddr)
+		if lnAddr.IP.Equal(addr.IP) && lnAddr.Port == addr.Port {
+			return ln
 		}
 	}
-	return diff
+	return nil
 }
 
-func addrDiff(a, b []*net.TCPAddr) []*net.TCPAddr {
-	var diff []*net.TCPAddr
-	for _, v := range a {
-		var match bool
-		for _, val := range b {
-			if v.IP.Equal(val.IP) && v.Port == val.Port {
-				match = true
-				break
-			}
-		}
-		if !match {
-			diff = append(diff, v)
-		}
-	}
-	return diff
-}
-
-func runWorker() {
-	var sig = make(chan os.Signal)
-	signal.Notify(sig, syscall.SIGHUP)
-	signal.Notify(sig, syscall.SIGTERM)
-
-	v := <-sig
-	if v.(syscall.Signal) == syscall.SIGHUP {
-		//请求优雅退出
-		closeListeners()
-		Wait()
-	}
-
-	//广播退出事件
-	for _, f := range events {
-		f()
-	}
-	os.Exit(0)
-}
-
-func createWorker(lns []net.Listener) (*exec.Cmd, error) {
+func (m *master) createCmd(lns ...net.Listener) (*exec.Cmd, error) {
 	var (
 		err   error
 		file  *os.File
 		files []*os.File
 	)
+	defer func() {
+		if err != nil {
+			for _, file = range files {
+				_ = file.Close()
+			}
+		}
+	}()
+
 	for _, v := range lns {
 		if file, err = v.(*net.TCPListener).File(); err != nil {
 			return nil, err

@@ -5,27 +5,18 @@ import (
 	"sync"
 )
 
-var (
-	listeners  []*Listener
-	wgListener sync.WaitGroup
-)
-
 type Listener struct {
 	net.Listener
-	wg   *sync.WaitGroup
-	once *sync.Once
+	once   sync.Once
+	wg     sync.WaitGroup
+	worker *worker
 }
 
-func parseListeners(lns []net.Listener) []*Listener {
-	wgListener.Add(len(lns))
-	for _, ln := range lns {
-		listeners = append(listeners, &Listener{
-			Listener: ln,
-			wg:       new(sync.WaitGroup),
-			once:     new(sync.Once),
-		})
+func newListener(ln net.Listener, worker *worker) *Listener {
+	return &Listener{
+		Listener: ln,
+		worker:   worker,
 	}
-	return listeners
 }
 
 func (l *Listener) Accept() (net.Conn, error) {
@@ -34,26 +25,15 @@ func (l *Listener) Accept() (net.Conn, error) {
 		l.wg.Done()
 		return nil, err
 	} else {
-		return newConnection(l.wg, c), nil
+		return newConnection(c, l), nil
 	}
 }
 
 func (l *Listener) Close() error {
-	l.once.Do(func() {
-		wgListener.Done()
-	})
+	defer func() {
+		l.once.Do(func() {
+			l.worker.waitGroup.Done()
+		})
+	}()
 	return l.Listener.Close()
-}
-
-func Wait() {
-	wgListener.Wait()
-	for _, v := range listeners {
-		v.wg.Wait()
-	}
-}
-
-func closeListeners() {
-	for _, ln := range listeners {
-		ln.Close()
-	}
 }
