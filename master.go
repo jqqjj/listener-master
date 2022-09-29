@@ -120,7 +120,7 @@ func (m *master) loopEvent() {
 			m.mux.Lock()
 			for worker := range m.workers {
 				if cmd != worker {
-					_ = cmd.Process.Signal(syscall.SIGHUP)
+					_ = worker.Process.Signal(syscall.SIGHUP)
 				}
 			}
 			m.mux.Unlock()
@@ -133,7 +133,7 @@ func (m *master) loopEvent() {
 
 func (m *master) attach(cmd *exec.Cmd, lns ...net.Listener) {
 	m.mux.Lock()
-	defer m.mux.TryLock()
+	defer m.mux.Unlock()
 
 	for _, ln := range lns {
 		if _, ok := m.listenerMap[ln]; !ok {
@@ -155,7 +155,7 @@ func (m *master) attach(cmd *exec.Cmd, lns ...net.Listener) {
 
 func (m *master) detach(cmd *exec.Cmd) {
 	m.mux.Lock()
-	defer m.mux.TryLock()
+	defer m.mux.Unlock()
 
 	for ln, commands := range m.listenerMap {
 		index := -1

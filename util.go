@@ -7,9 +7,9 @@ import (
 )
 
 var (
-	booted  bool
-	masterE *master
-	workerE *worker
+	booted       bool
+	masterEntity *master
+	workerEntity *worker
 )
 
 func Listeners(resolveAddrFunc func() []string) []*Listener {
@@ -34,24 +34,24 @@ func Listeners(resolveAddrFunc func() []string) []*Listener {
 	}
 
 	if len(bootListeners) == 0 {
-		masterE = newMaster(resolveAddrFunc)
-		masterE.run()
+		masterEntity = newMaster(resolveAddrFunc)
+		masterEntity.run()
 	} else {
-		workerE = newWorker(bootListeners)
-		go workerE.run()
+		workerEntity = newWorker(bootListeners)
+		go workerEntity.run()
 	}
-	return workerE.listeners()
+	return workerEntity.listeners()
 }
 
 func Wait() {
-	if workerE != nil {
-		workerE.wait()
+	if workerEntity != nil {
+		workerEntity.waitQuit()
 	}
 }
 
 func RegisterExitEvent(event func()) {
-	if workerE != nil {
-		workerE.registerExitEvent(event)
+	if workerEntity != nil {
+		workerEntity.registerExitEvent(event)
 	}
 }
 

@@ -10,12 +10,15 @@ import (
 
 type worker struct {
 	waitGroup sync.WaitGroup
+	shutdown  chan struct{}
 	lns       []*Listener
 	events    []func()
 }
 
 func newWorker(lns []net.Listener) *worker {
-	w := &worker{}
+	w := &worker{
+		shutdown: make(chan struct{}),
+	}
 	for _, ln := range lns {
 		w.lns = append(w.lns, newListener(ln, w))
 	}
@@ -45,7 +48,7 @@ func (w *worker) run() {
 		case <-sigHub:
 			//关闭ln并等待conn关闭
 			w.closeAllListeners()
-			w.wait()
+			w.waitListenerAndConnectionClose()
 			once.Do(func() { close(done) })
 		}
 	}()
@@ -64,14 +67,19 @@ func (w *worker) run() {
 	for _, f := range w.events {
 		f()
 	}
-	os.Exit(0)
+	close(w.shutdown)
 }
 
-func (w *worker) wait() {
+func (w *worker) waitListenerAndConnectionClose() {
 	w.waitGroup.Wait()
 	for _, v := range w.lns {
 		v.wg.Wait()
 	}
+}
+
+func (w *worker) waitQuit() {
+	w.waitListenerAndConnectionClose()
+	<-w.shutdown
 }
 
 func (w *worker) registerExitEvent(event func()) {
