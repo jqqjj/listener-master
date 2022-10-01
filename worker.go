@@ -1,7 +1,6 @@
 package master
 
 import (
-	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -15,12 +14,13 @@ type worker struct {
 	events    []func()
 }
 
-func newWorker(lns []net.Listener) *worker {
+func newWorker(lns []*Listener) *worker {
 	w := &worker{
 		shutdown: make(chan struct{}),
+		lns:      lns,
 	}
-	for _, ln := range lns {
-		w.lns = append(w.lns, newListener(ln, w))
+	for _, ln := range w.lns {
+		ln.worker = w
 	}
 	if len(w.lns) > 0 {
 		w.waitGroup.Add(len(w.lns))

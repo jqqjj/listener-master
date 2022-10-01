@@ -8,7 +8,6 @@ import (
 
 var (
 	booted       bool
-	masterEntity *master
 	workerEntity *worker
 )
 
@@ -18,28 +17,28 @@ func Listeners(resolveAddrFunc func() []string) []*Listener {
 	}
 	booted = true
 
-	bootListeners := getParentListeners()
-	//非linux系统视当前进程为worker
-	if runtime.GOOS != "linux" {
-		var (
-			err       error
-			addresses = resolveAddrFunc()
-		)
+	var (
+		err       error
+		listeners = getParentListeners()
+	)
+
+	if len(listeners) == 0 && runtime.GOOS == "linux" {
+		masterEntity := newMaster(resolveAddrFunc)
+		masterEntity.run()
+	}
+
+	if len(listeners) == 0 {
+		addresses := resolveAddrFunc()
 		if len(addresses) == 0 {
 			panic("getAddrFunc resolve empty addr")
 		}
-		if bootListeners, err = createListeners(addresses); err != nil {
+		if listeners, err = createListenersWithAddr(addresses); err != nil {
 			panic(err)
 		}
 	}
+	workerEntity = newWorker(listeners)
+	go workerEntity.run()
 
-	if len(bootListeners) == 0 {
-		masterEntity = newMaster(resolveAddrFunc)
-		masterEntity.run()
-	} else {
-		workerEntity = newWorker(bootListeners)
-		go workerEntity.run()
-	}
 	return workerEntity.listeners()
 }
 
@@ -55,11 +54,10 @@ func RegisterExitEvent(event func()) {
 	}
 }
 
-func createListeners(addresses []string) (lns []net.Listener, err error) {
+func createListenersWithAddr(addresses []string) (lns []*Listener, err error) {
 	var (
-		ln       net.Listener
-		iterator *net.TCPAddr
-		tcpAddr  []*net.TCPAddr
+		ln      net.Listener
+		tcpAddr *net.TCPAddr
 	)
 	defer func() {
 		if err != nil {
@@ -68,24 +66,19 @@ func createListeners(addresses []string) (lns []net.Listener, err error) {
 			}
 		}
 	}()
-
 	for _, v := range addresses {
-		if iterator, err = net.ResolveTCPAddr("tcp", v); err != nil {
+		if tcpAddr, err = net.ResolveTCPAddr("tcp", v); err != nil {
 			return nil, err
 		}
-		tcpAddr = append(tcpAddr, iterator)
-	}
-
-	for _, addr := range tcpAddr {
-		if ln, err = net.ListenTCP("tcp", addr); err != nil {
+		if ln, err = net.ListenTCP("tcp", tcpAddr); err != nil {
 			return nil, err
 		}
-		lns = append(lns, ln)
+		lns = append(lns, &Listener{Listener: ln})
 	}
 	return
 }
 
-func getParentListeners() (lns []net.Listener) {
+func getParentListeners() (lns []*Listener) {
 	var (
 		err  error
 		file *os.File
@@ -97,7 +90,7 @@ func getParentListeners() (lns []net.Listener) {
 		if ln, err = net.FileListener(file); err != nil {
 			break
 		}
-		lns = append(lns, ln)
+		lns = append(lns, &Listener{Listener: ln, file: file})
 	}
 	return
 }
