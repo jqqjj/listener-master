@@ -237,8 +237,13 @@ func (m *master) findListener(addr *net.TCPAddr) net.Listener {
 
 	for ln := range m.listenerMap {
 		lnAddr := ln.Addr().(*net.TCPAddr)
-		if lnAddr.IP.Equal(addr.IP) && lnAddr.Port == addr.Port {
-			return ln
+		if lnAddr.Port == addr.Port {
+			if lnAddr.IP.IsUnspecified() && (addr.IP == nil || addr.IP.IsUnspecified()) {
+				return ln
+			}
+			if lnAddr.IP.Equal(addr.IP) {
+				return ln
+			}
 		}
 	}
 	return nil
